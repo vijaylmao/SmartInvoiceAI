@@ -1,27 +1,14 @@
 import sqlite3
 import re
-import os
-import shutil
 
 import streamlit as st
 import pymupdf as fitz
 import pytesseract
 import io 
 from PIL import Image
-# Tesseract OCR configuration (Local + Cloud)
-tesseract_path = shutil.which("tesseract")
-
-if tesseract_path:
-    pytesseract.pytesseract.tesseract_cmd = tesseract_path
-else:
-    windows_tesseract_path = (
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    )
-
-    if os.path.exists(windows_tesseract_path):
-        pytesseract.pytesseract.tesseract_cmd = (
-            windows_tesseract_path
-        )
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
 
 from validation import validate_invoice
 from duplicate import detect_duplicate
@@ -624,7 +611,6 @@ with st.sidebar:
             "Invoice Processing",
             "Three-Way Matching",
             "Invoices",
-            "Vendor Management",
             "Analytics",
             "Settings",
             "About",
@@ -1034,6 +1020,80 @@ elif page == "Three-Way Matching":
         "the current invoice upload workflow does not extract invoice line items."
     )
 
+    # Purchase-order registration: the cloud database starts empty, so create a PO here.
+    vendor_options = query_db(
+        "SELECT vendor_id, vendor_name, gstin FROM vendors ORDER BY vendor_name"
+    )
+
+    st.markdown("### Purchase Order Management")
+    if not vendor_options:
+        st.warning("Add and approve a vendor in Vendor Management before creating a purchase order.")
+    else:
+        vendor_labels = {
+            row["vendor_id"]: f'{row["vendor_name"]} · {row.get("gstin") or "No GSTIN"}'
+            for row in vendor_options
+        }
+        with st.expander("➕ Create a purchase order", expanded=True):
+            with st.form("create_purchase_order_form", clear_on_submit=True):
+                selected_vendor_id = st.selectbox(
+                    "Vendor", options=[row["vendor_id"] for row in vendor_options],
+                    format_func=lambda value: vendor_labels[value],
+                )
+                po_col1, po_col2 = st.columns(2)
+                with po_col1:
+                    new_po_number = st.text_input(
+                        "PO number", placeholder="Example: BPFS-PO-507"
+                    )
+                    po_subtotal = st.number_input(
+                        "PO subtotal before tax (₹)", min_value=0.0,
+                        step=100.0, format="%.2f",
+                    )
+                with po_col2:
+                    po_tax = st.number_input(
+                        "PO tax amount (₹)", min_value=0.0,
+                        step=100.0, format="%.2f",
+                    )
+                    po_tolerance = st.number_input(
+                        "Matching tolerance (%)", min_value=0.0,
+                        max_value=100.0, value=2.0, step=0.5,
+                    )
+                po_total = po_subtotal + po_tax
+                st.caption(f"PO total amount: {money(po_total)}")
+                save_po = st.form_submit_button(
+                    "Save Purchase Order", type="primary", use_container_width=True
+                )
+
+            if save_po:
+                clean_po_number = new_po_number.strip()
+                if not clean_po_number:
+                    st.error("Enter a PO number.")
+                elif po_subtotal <= 0:
+                    st.error("PO subtotal must be greater than zero.")
+                else:
+                    conn = sqlite3.connect(DB_NAME)
+                    try:
+                        conn.execute("PRAGMA foreign_keys = ON")
+                        conn.execute(
+                            """INSERT INTO purchase_orders
+                               (po_number, vendor_id, subtotal, tax_amount,
+                                total_amount, tolerance_percent, status)
+                               VALUES (?, ?, ?, ?, ?, ?, 'Open')""",
+                            (
+                                clean_po_number, selected_vendor_id,
+                                float(po_subtotal), float(po_tax), float(po_total),
+                                float(po_tolerance),
+                            ),
+                        )
+                        conn.commit()
+                        st.success(f"Purchase order {clean_po_number} created.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("That PO number already exists. Use a different PO number.")
+                    finally:
+                        conn.close()
+
+    st.markdown("---")
+
     po_options = query_db(
         """SELECT p.po_id, p.po_number, p.subtotal, p.total_amount, p.vendor_id,
                   v.vendor_name, v.gstin
@@ -1385,243 +1445,6 @@ elif page == "Invoices":
                 st.error(f"Decision: Rejected — {detail['decision_reason'] or ''}")
     else:
         st.info("No invoices match your search and filter settings.")
-
-
-
-# ============================================================
-# PAGE: VENDOR MANAGEMENT
-# ============================================================
-
-elif page == "Vendor Management":
-    page_header(
-        "Vendor Management",
-        "Register suppliers, maintain vendor details and control approval status.",
-    )
-
-    vendor_search = st.text_input(
-        "Search vendors",
-        placeholder="Search by vendor name or GSTIN...",
-        key="vendor_search_text",
-    )
-
-    vendor_query = """
-        SELECT vendor_id AS 'Vendor ID',
-               vendor_name AS 'Vendor Name',
-               gstin AS 'GSTIN',
-               email AS 'Email',
-               is_approved AS 'Approval Status'
-        FROM vendors
-        WHERE 1 = 1
-    """
-    vendor_params = []
-    if vendor_search.strip():
-        pattern = f"%{vendor_search.strip()}%"
-        vendor_query += " AND (vendor_name LIKE ? OR gstin LIKE ?)"
-        vendor_params.extend([pattern, pattern])
-    vendor_query += " ORDER BY vendor_id DESC"
-    vendor_rows = query_db(vendor_query, tuple(vendor_params))
-
-    total_vendors = query_db("SELECT COUNT(*) AS total FROM vendors")[0]["total"]
-    approved_vendors = query_db(
-        "SELECT COUNT(*) AS total FROM vendors WHERE is_approved = 1"
-    )[0]["total"]
-    inactive_vendors = total_vendors - approved_vendors
-
-    metric_cols = st.columns(3)
-    metric_cols[0].metric("Total Vendors", total_vendors)
-    metric_cols[1].metric("Approved Vendors", approved_vendors)
-    metric_cols[2].metric("Not Approved", inactive_vendors)
-
-    st.markdown("---")
-    add_tab, manage_tab = st.tabs(["Add Vendor", "View / Edit Vendors"])
-
-    with add_tab:
-        st.markdown("### Register a new vendor")
-        with st.form("add_vendor_form", clear_on_submit=True):
-            new_vendor_name = st.text_input(
-                "Vendor / Company Name",
-                placeholder="Enter registered company name",
-            )
-            new_vendor_gstin = st.text_input(
-                "GSTIN",
-                placeholder="15-character GSTIN",
-                max_chars=15,
-            ).strip().upper()
-            new_vendor_email = st.text_input(
-                "Email Address",
-                placeholder="vendor@example.com",
-            ).strip()
-            new_vendor_approved = st.checkbox(
-                "Approve this vendor",
-                value=False,
-                help="Only approve vendors after completing your verification.",
-            )
-            add_vendor_submit = st.form_submit_button(
-                "Save Vendor", type="primary", use_container_width=True
-            )
-
-        if add_vendor_submit:
-            clean_name = new_vendor_name.strip()
-            clean_gstin = new_vendor_gstin
-            if not clean_name:
-                st.error("Enter the vendor or company name.")
-            elif len(clean_gstin) != 15:
-                st.error("Enter a valid 15-character GSTIN.")
-            else:
-                conn = sqlite3.connect(DB_NAME)
-                try:
-                    conn.execute(
-                        """
-                        INSERT INTO vendors (vendor_name, gstin, email, is_approved)
-                        VALUES (?, ?, ?, ?)
-                        """,
-                        (
-                            clean_name,
-                            clean_gstin,
-                            new_vendor_email or None,
-                            1 if new_vendor_approved else 0,
-                        ),
-                    )
-                    conn.commit()
-                    st.success(f"Vendor '{clean_name}' added successfully.")
-                    st.rerun()
-                except sqlite3.IntegrityError:
-                    st.error("This GSTIN is already registered. Search for the vendor instead.")
-                except sqlite3.Error as error:
-                    st.error(f"Could not save vendor: {error}")
-                finally:
-                    conn.close()
-
-    with manage_tab:
-        st.markdown("### Registered vendors")
-        if vendor_rows:
-            display_rows = [
-                {
-                    **row,
-                    "Approval Status": (
-                        "Approved" if row["Approval Status"] == 1 else "Not approved"
-                    ),
-                }
-                for row in vendor_rows
-            ]
-            st.dataframe(
-                display_rows,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            vendor_ids = [row["Vendor ID"] for row in vendor_rows]
-            selected_vendor_id = st.selectbox(
-                "Select vendor to edit or update approval",
-                vendor_ids,
-                format_func=lambda vendor_id: next(
-                    (
-                        f'{row["Vendor Name"]} · {row["GSTIN"]}'
-                        for row in vendor_rows
-                        if row["Vendor ID"] == vendor_id
-                    ),
-                    f"Vendor ID {vendor_id}",
-                ),
-                key="selected_vendor_management_id",
-            )
-            selected_vendor = next(
-                row for row in vendor_rows if row["Vendor ID"] == selected_vendor_id
-            )
-
-            st.markdown("#### Edit vendor details")
-            with st.form("edit_vendor_form"):
-                edit_name = st.text_input(
-                    "Vendor / Company Name",
-                    value=selected_vendor["Vendor Name"] or "",
-                    key=f"edit_vendor_name_{selected_vendor_id}",
-                )
-                edit_gstin = st.text_input(
-                    "GSTIN",
-                    value=selected_vendor["GSTIN"] or "",
-                    max_chars=15,
-                    key=f"edit_vendor_gstin_{selected_vendor_id}",
-                ).strip().upper()
-                edit_email = st.text_input(
-                    "Email Address",
-                    value=selected_vendor["Email"] or "",
-                    key=f"edit_vendor_email_{selected_vendor_id}",
-                ).strip()
-                save_vendor_changes = st.form_submit_button(
-                    "Save Changes", type="primary"
-                )
-
-            if save_vendor_changes:
-                if not edit_name.strip():
-                    st.error("Vendor name cannot be empty.")
-                elif len(edit_gstin) != 15:
-                    st.error("Enter a valid 15-character GSTIN.")
-                else:
-                    conn = sqlite3.connect(DB_NAME)
-                    try:
-                        conn.execute(
-                            """
-                            UPDATE vendors
-                            SET vendor_name = ?, gstin = ?, email = ?
-                            WHERE vendor_id = ?
-                            """,
-                            (
-                                edit_name.strip(),
-                                edit_gstin,
-                                edit_email or None,
-                                selected_vendor_id,
-                            ),
-                        )
-                        conn.commit()
-                        st.success("Vendor details updated successfully.")
-                        st.rerun()
-                    except sqlite3.IntegrityError:
-                        st.error("That GSTIN is already assigned to another vendor.")
-                    except sqlite3.Error as error:
-                        st.error(f"Could not update vendor: {error}")
-                    finally:
-                        conn.close()
-
-            current_approval = selected_vendor["Approval Status"] == 1
-            st.markdown("#### Vendor approval")
-            st.write(
-                "Current status:",
-                "Approved" if current_approval else "Not approved",
-            )
-            if current_approval:
-                if st.button(
-                    "Deactivate Vendor",
-                    key=f"deactivate_vendor_{selected_vendor_id}",
-                ):
-                    conn = sqlite3.connect(DB_NAME)
-                    try:
-                        conn.execute(
-                            "UPDATE vendors SET is_approved = 0 WHERE vendor_id = ?",
-                            (selected_vendor_id,),
-                        )
-                        conn.commit()
-                        st.success("Vendor deactivated.")
-                        st.rerun()
-                    finally:
-                        conn.close()
-            else:
-                if st.button(
-                    "Approve Vendor",
-                    type="primary",
-                    key=f"approve_vendor_{selected_vendor_id}",
-                ):
-                    conn = sqlite3.connect(DB_NAME)
-                    try:
-                        conn.execute(
-                            "UPDATE vendors SET is_approved = 1 WHERE vendor_id = ?",
-                            (selected_vendor_id,),
-                        )
-                        conn.commit()
-                        st.success("Vendor approved.")
-                        st.rerun()
-                    finally:
-                        conn.close()
-        else:
-            st.info("No vendors found. Add your first vendor using the Add Vendor tab.")
 
 
 # ============================================================

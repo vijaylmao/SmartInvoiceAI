@@ -1,14 +1,27 @@
 import sqlite3
 import re
+import os
+import shutil
 
 import streamlit as st
 import pymupdf as fitz
 import pytesseract
 import io 
 from PIL import Image
-pytesseract.pytesseract.tesseract_cmd = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-)
+# Tesseract OCR configuration (Local + Cloud)
+tesseract_path = shutil.which("tesseract")
+
+if tesseract_path:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+else:
+    windows_tesseract_path = (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    )
+
+    if os.path.exists(windows_tesseract_path):
+        pytesseract.pytesseract.tesseract_cmd = (
+            windows_tesseract_path
+        )
 
 from validation import validate_invoice
 from duplicate import detect_duplicate

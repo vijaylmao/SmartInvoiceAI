@@ -78,6 +78,25 @@ def ensure_grn_tables():
 ensure_grn_tables()
 
 
+def ensure_vendor_status_column():
+    """Add explicit vendor approval workflow without disturbing existing records."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(vendors)").fetchall()]
+        if "approval_status" not in columns:
+            conn.execute("ALTER TABLE vendors ADD COLUMN approval_status TEXT DEFAULT 'Pending'")
+            conn.execute("""
+                UPDATE vendors
+                SET approval_status = CASE WHEN is_approved = 1 THEN 'Approved' ELSE 'Pending' END
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+ensure_vendor_status_column()
+
+
 # ============================================================
 # LIGHT THEME - PURPLE ACCENTS
 # ============================================================
@@ -1451,6 +1470,122 @@ elif page == "Invoices":
 # ============================================================
 # PAGE: ANALYTICS
 # ============================================================
+
+elif page == "Vendor Management":
+    page_header(
+        "Vendor Management",
+        "Register suppliers, review vendor applications and manage approval status.",
+    )
+
+    vendor_counts = query_db("""
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN approval_status = 'Approved' THEN 1 ELSE 0 END) AS approved,
+               SUM(CASE WHEN approval_status = 'Pending' THEN 1 ELSE 0 END) AS pending,
+               SUM(CASE WHEN approval_status = 'Rejected' THEN 1 ELSE 0 END) AS rejected
+        FROM vendors
+    """)[0]
+    kpi_cols = st.columns(4)
+    for col, label, value in zip(
+        kpi_cols,
+        ["Total Vendors", "Approved", "Pending", "Rejected"],
+        [vendor_counts.get("total") or 0, vendor_counts.get("approved") or 0,
+         vendor_counts.get("pending") or 0, vendor_counts.get("rejected") or 0],
+    ):
+        with col:
+            st.metric(label, value)
+
+    st.markdown("---")
+    add_tab, manage_tab = st.tabs(["Add Vendor", "View / Review Vendors"])
+
+    with add_tab:
+        st.markdown("### Register a new vendor")
+        with st.form("register_vendor_form", clear_on_submit=True):
+            new_vendor_name = st.text_input("Vendor / Company name")
+            new_vendor_gstin = st.text_input("GSTIN", max_chars=15).strip().upper()
+            new_vendor_email = st.text_input("Email address")
+            submitted = st.form_submit_button("Register Vendor", type="primary")
+            if submitted:
+                if not new_vendor_name.strip() or not new_vendor_gstin:
+                    st.error("Please enter both vendor name and GSTIN.")
+                elif len(new_vendor_gstin) != 15:
+                    st.error("GSTIN must contain exactly 15 characters.")
+                else:
+                    conn = sqlite3.connect(DB_NAME)
+                    try:
+                        conn.execute(
+                            "INSERT INTO vendors (vendor_name, gstin, email, is_approved, approval_status) VALUES (?, ?, ?, 0, 'Pending')",
+                            (new_vendor_name.strip(), new_vendor_gstin, new_vendor_email.strip()),
+                        )
+                        conn.commit()
+                        st.success("Vendor registered with Pending status. Review it in the View / Review Vendors tab.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("A vendor with this GSTIN already exists.")
+                    finally:
+                        conn.close()
+
+    with manage_tab:
+        search_vendor = st.text_input(
+            "Search vendors", placeholder="Search by vendor name or GSTIN...", key="vendor_management_search"
+        )
+        status_filter = st.selectbox(
+            "Filter by vendor status", ["All", "Approved", "Pending", "Rejected"],
+            key="vendor_status_filter",
+        )
+        vendor_sql = "SELECT vendor_id AS 'Vendor ID', vendor_name AS 'Vendor Name', gstin AS 'GSTIN', email AS 'Email', approval_status AS 'Status' FROM vendors WHERE 1=1"
+        vendor_params = []
+        if search_vendor.strip():
+            vendor_sql += " AND (vendor_name LIKE ? OR gstin LIKE ?)"
+            vendor_params.extend([f"%{search_vendor.strip()}%", f"%{search_vendor.strip()}%"])
+        if status_filter != "All":
+            vendor_sql += " AND approval_status = ?"
+            vendor_params.append(status_filter)
+        vendor_sql += " ORDER BY vendor_id DESC"
+        vendor_rows = query_db(vendor_sql, tuple(vendor_params))
+        if vendor_rows:
+            st.dataframe(vendor_rows, use_container_width=True, hide_index=True)
+            vendor_choices = query_db(
+                "SELECT vendor_id, vendor_name, gstin, email, approval_status FROM vendors ORDER BY vendor_name"
+            )
+            chosen_id = st.selectbox(
+                "Select vendor to review",
+                options=[row["vendor_id"] for row in vendor_choices],
+                format_func=lambda value: next(
+                    f"{row['vendor_name']} · {row['gstin']} · {row['approval_status']}"
+                    for row in vendor_choices if row["vendor_id"] == value
+                ),
+                key="vendor_review_select",
+            )
+            chosen = next(row for row in vendor_choices if row["vendor_id"] == chosen_id)
+            st.markdown("### Vendor details")
+            st.write(f"**Name:** {chosen['vendor_name']}")
+            st.write(f"**GSTIN:** {chosen['gstin']}")
+            st.write(f"**Email:** {chosen['email'] or '—'}")
+            st.write(f"**Current status:** {chosen['approval_status']}")
+            status_col, action_col = st.columns([2, 1])
+            with status_col:
+                new_status = st.selectbox(
+                    "Update vendor status", ["Pending", "Approved", "Rejected"],
+                    index=["Pending", "Approved", "Rejected"].index(chosen["approval_status"]),
+                    key=f"vendor_status_update_{chosen_id}",
+                )
+            with action_col:
+                st.write("")
+                st.write("")
+                if st.button("Save Status", type="primary", key=f"save_vendor_status_{chosen_id}"):
+                    conn = sqlite3.connect(DB_NAME)
+                    try:
+                        conn.execute(
+                            "UPDATE vendors SET approval_status = ?, is_approved = ? WHERE vendor_id = ?",
+                            (new_status, 1 if new_status == "Approved" else 0, chosen_id),
+                        )
+                        conn.commit()
+                        st.success(f"Vendor status updated to {new_status}.")
+                        st.rerun()
+                    finally:
+                        conn.close()
+        else:
+            st.info("No vendors match the selected search and status filter.")
 
 elif page == "Analytics":
     page_header("Analytics", "Understand invoice outcomes and processing volumes.")

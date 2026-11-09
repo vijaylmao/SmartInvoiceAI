@@ -611,6 +611,7 @@ with st.sidebar:
             "Invoice Processing",
             "Three-Way Matching",
             "Invoices",
+            "Vendor Management",
             "Analytics",
             "Settings",
             "About",
